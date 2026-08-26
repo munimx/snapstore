@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 )
 
 var release = envOr("LIFTOFF_COMMIT", "dev")
@@ -150,9 +149,8 @@ func list(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, item := range page.Segment.BlobItems {
-			var b *blob.Item = item
-			if b.Name != nil {
-				names = append(names, *b.Name)
+			if item != nil && item.Name != nil {
+				names = append(names, *item.Name)
 			}
 		}
 	}
