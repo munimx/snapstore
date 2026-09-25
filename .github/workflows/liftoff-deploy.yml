@@ -1,0 +1,266 @@
+name: Liftoff Deploy
+
+on:
+  push:
+    branches: ['main']
+    # Liftoff rewrites this file whenever the canvas changes and commits it.
+    # That commit is a push, so without this every configuration change would
+    # start a full build of unchanged code. A run is skipped only when the
+    # commit touches nothing else, so real code alongside it still builds.
+    paths-ignore:
+      - '.github/workflows/liftoff-deploy.yml'
+  # Allows POST /api/v1/.../build to trigger a fresh build without a code push.
+  # The API hits GitHub's workflows/{file}/dispatches endpoint with this branch.
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - name: "snapstore"
+            context: "."
+            dockerfilePath: "Dockerfile"
+            buildStrategy: "auto"
+            imageRepository: "azlab/production/snapstore"
+            command: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        id: build
+        env:
+          SERVICE_NAME: ${{ matrix.service.name }}
+          IMAGE_URI: liftoff01bf9fx9.azurecr.io/${{ matrix.service.imageRepository }}:${{ github.sha }}
+          CONFIGURED_BUILD_STRATEGY: ${{ matrix.service.buildStrategy }}
+          CONFIGURED_DOCKERFILE_PATH: ${{ matrix.service.dockerfilePath }}
+          CONFIGURED_DOCKER_CONTEXT: ${{ matrix.service.context }}
+          CONFIGURED_START_COMMAND: ${{ matrix.service.command }}
+
+        # Capture every command's stdout+stderr to /tmp/build.log via tee. Notify
+        # Liftoff (always-runs) reads the tail of this file so failed builds
+        # surface the actual error in our UI instead of just "FAILED".
+        #
+        # CONFIGURED_DOCKERFILE_PATH is REPO-ROOT-relative: Liftoff resolves the
+        # context-relative dockerfile_path at workflow generation time, so this
+        # script never joins paths itself.
+        run: |
+          set -euo pipefail
+          : > /tmp/build.log
+          exec > >(tee -a /tmp/build.log) 2>&1
+
+          BUILD_STRATEGY=""
+          BUILD_PLAN=""
+          NIXPACKS_VERSION="1.29.1"
+          DOCKER_BUILD_ARGS=""
+          NIXPACKS_ENV_ARGS=""
+
+          install_nixpacks() {
+            echo "::group::nixpacks install (v$NIXPACKS_VERSION, pinned)"
+            if ! curl -fsSL --retry 3 -o /tmp/nixpacks.tar.gz \
+              "https://github.com/railwayapp/nixpacks/releases/download/v${NIXPACKS_VERSION}/nixpacks-v${NIXPACKS_VERSION}-x86_64-unknown-linux-musl.tar.gz"; then
+              echo "::error::Failed to download Nixpacks v$NIXPACKS_VERSION from GitHub releases — the pinned release may have been removed"
+              exit 1
+            fi
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf /tmp/nixpacks.tar.gz -C "$HOME/.local/bin"
+            export PATH="$HOME/.local/bin:$PATH"
+            echo "Installed nixpacks $(nixpacks --version)"
+            echo "::endgroup::"
+          }
+
+          # Best-effort plan capture: a failed or malformed plan must not fail
+          # the build (nixpacks build re-plans internally) — it only means the
+          # UI loses detection hints for this deploy.
+          capture_nixpacks_plan() {
+            echo "::group::nixpacks plan"
+            if PLAN_OUTPUT="$(nixpacks plan "$CONFIGURED_DOCKER_CONTEXT" --format json 2>/tmp/nixpacks-plan.err)"; then
+              PLAN_OUTPUT="$(printf '%s' "$PLAN_OUTPUT" | tr -d '\n')"
+              if printf '%s' "$PLAN_OUTPUT" | python3 -m json.tool > /dev/null 2>&1; then
+                BUILD_PLAN="$PLAN_OUTPUT"
+                echo "Captured nixpacks plan"
+              else
+                echo "::warning::nixpacks plan emitted non-JSON output; continuing without a stored plan"
+              fi
+            else
+              echo "::warning::nixpacks plan failed; continuing without a stored plan"
+              cat /tmp/nixpacks-plan.err || true
+            fi
+            echo "::endgroup::"
+          }
+
+          run_nixpacks_build() {
+            install_nixpacks
+            capture_nixpacks_plan
+            echo "::group::nixpacks build"
+            if [ -n "$CONFIGURED_START_COMMAND" ]; then
+              nixpacks build "$CONFIGURED_DOCKER_CONTEXT" $NIXPACKS_ENV_ARGS --start-cmd "$CONFIGURED_START_COMMAND" --name "$IMAGE_URI"
+            else
+              nixpacks build "$CONFIGURED_DOCKER_CONTEXT" $NIXPACKS_ENV_ARGS --name "$IMAGE_URI"
+            fi
+            echo "::endgroup::"
+          }
+
+          run_docker_build() {
+            if [ ! -f "$CONFIGURED_DOCKERFILE_PATH" ]; then
+              echo "::error::Dockerfile not found at '$CONFIGURED_DOCKERFILE_PATH' (repo-root-relative, resolved from context + dockerfile_path). Fix the service's dockerfile_path or switch the build strategy."
+              exit 1
+            fi
+            echo "::group::docker build"
+            docker build $DOCKER_BUILD_ARGS -f "$CONFIGURED_DOCKERFILE_PATH" -t "$IMAGE_URI" "$CONFIGURED_DOCKER_CONTEXT"
+            echo "::endgroup::"
+          }
+
+          echo "::group::Resolving build strategy"
+          # auto-detect: the CONFIGURED Dockerfile path wins when present,
+          # otherwise Nixpacks; explicit overrides honored.
+          if [ "$CONFIGURED_BUILD_STRATEGY" = "dockerfile" ]; then
+            BUILD_STRATEGY="dockerfile"
+            echo "Strategy: dockerfile (explicit) — context=$CONFIGURED_DOCKER_CONTEXT dockerfile=$CONFIGURED_DOCKERFILE_PATH"
+            echo "::endgroup::"
+            run_docker_build
+          elif [ "$CONFIGURED_BUILD_STRATEGY" = "nixpacks" ]; then
+            BUILD_STRATEGY="nixpacks"
+            echo "Strategy: nixpacks (explicit) — context=$CONFIGURED_DOCKER_CONTEXT"
+            echo "::endgroup::"
+            run_nixpacks_build
+          elif [ -f "$CONFIGURED_DOCKERFILE_PATH" ]; then
+            BUILD_STRATEGY="dockerfile"
+            echo "Strategy: dockerfile (auto-detected at $CONFIGURED_DOCKERFILE_PATH) — context=$CONFIGURED_DOCKER_CONTEXT"
+            echo "::endgroup::"
+            run_docker_build
+          else
+            BUILD_STRATEGY="nixpacks"
+            echo "Strategy: nixpacks (auto-detected — no Dockerfile at $CONFIGURED_DOCKERFILE_PATH) — context=$CONFIGURED_DOCKER_CONTEXT"
+            echo "::endgroup::"
+            run_nixpacks_build
+          fi
+
+          {
+            echo "image_uri=$IMAGE_URI"
+            echo "build_strategy=$BUILD_STRATEGY"
+            echo "build_plan<<LIFTOFF_BUILD_PLAN"
+            echo "$BUILD_PLAN"
+            echo "LIFTOFF_BUILD_PLAN"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Azure Container Registry
+        env:
+          REGISTRY: liftoff01bf9fx9.azurecr.io
+          LIFTOFF_SECRET: ${{ secrets.LIFTOFF_DEPLOY_SECRET_CMUFMLNTZ00062TR1RD85OT7T }}
+          REGISTRY_USERNAME: ${{ secrets.AZURE_REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.AZURE_REGISTRY_PASSWORD }}
+        run: |
+          set -eu
+          USERNAME=""
+          PASSWORD=""
+          # `|| true` on both halves, for the reason the DigitalOcean step
+          # gives: a Liftoff that is unreachable, slow or answering an error must
+          # fall through to the secrets below rather than kill the step under
+          # `set -e` before the fallback is reached.
+          CREDENTIAL_RESPONSE="$(curl -sS --max-time 30 --retry 2 --retry-connrefused -X POST https://api.tryliftoff.tech/api/v1/build/registry-credential \
+            -H "X-Liftoff-Secret: ${LIFTOFF_SECRET:-}" \
+            -H "Content-Type: application/json" \
+            -d '{"environmentId":"cmufmlntz00062tr1rd85ot7t"}' || true)"
+          if [ -n "$CREDENTIAL_RESPONSE" ]; then
+            # One line each on purpose: this is a YAML block scalar, and a python
+            # snippet with its own indentation would end the block early.
+            USERNAME="$(printf '%s' "$CREDENTIAL_RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("username",""))' 2>/dev/null || true)"
+            PASSWORD="$(printf '%s' "$CREDENTIAL_RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("password",""))' 2>/dev/null || true)"
+          fi
+          # BOTH halves, not just the password. ACR needs the null-GUID username
+          # beside the token, and a response carrying one without the other
+          # would otherwise run `docker login --username ""` and fail with an
+          # auth error that looks nothing like the malformed response it is.
+          # Requiring both means a partial answer degrades to the stored
+          # credentials below, which are known to work.
+          if [ -n "$PASSWORD" ] && [ -n "$USERNAME" ]; then
+            # GitHub masks repository secrets on its own; a value fetched at run
+            # time it has never seen, so say so before it can reach a log.
+            echo "::add-mask::$PASSWORD"
+          else
+            # Defaulted rather than read bare: under `set -u` a secret that was
+            # never written to the repository is an unset variable, and the step
+            # would die with "unbound variable" instead of the message below.
+            USERNAME="${REGISTRY_USERNAME:-}"
+            PASSWORD="${REGISTRY_PASSWORD:-}"
+            if [ -n "$PASSWORD" ]; then
+              echo "::warning::Could not get a short-lived registry credential from Liftoff, so this build authenticated with Azure Container Registry credentials stored in this repository. Those do not expire and any workflow in this repository can read them. Re-sync this environment in Liftoff to remove them."
+            fi
+          fi
+          if [ -z "$PASSWORD" ]; then
+            echo "::error::Liftoff would not issue a registry credential for this build and no Azure registry credential is present in this repository's secrets. Check the environment in Liftoff and re-sync it."
+            exit 1
+          fi
+          printf '%s' "$PASSWORD" | docker login "$REGISTRY" --username "$USERNAME" --password-stdin
+
+      - name: Push image
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image_uri }}
+        run: |
+          set -eu
+          echo "::group::docker push"
+          docker push "$IMAGE_URI"
+          echo "::endgroup::"
+
+      # Runs even when the push fails, so a credential is never left on the
+      # runner for whatever a later step — or a re-run — decides to do.
+      - name: Forget registry credentials
+        if: always()
+        run: docker logout liftoff01bf9fx9.azurecr.io || true
+
+      - name: Notify Liftoff
+        if: always()
+        env:
+          SERVICE_NAME: ${{ matrix.service.name }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          IMAGE_URI: ${{ steps.build.outputs.image_uri }}
+          BUILD_STRATEGY: ${{ steps.build.outputs.build_strategy }}
+          BUILD_PLAN: ${{ steps.build.outputs.build_plan }}
+        # On any outcome we POST to /webhooks/deploy-complete. On failure, we
+        # also slurp the last ~96KB of /tmp/build.log (base64-encoded so JSON-safe)
+        # so the Liftoff UI can show the actual build error without the user having
+        # to leave for the GitHub Actions UI.
+        run: |
+          BUILD_PLAN_JSON="null"
+          if [ -n "$BUILD_PLAN" ]; then
+            BUILD_PLAN_JSON="$(printf '%s' "$BUILD_PLAN" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+          fi
+
+          BUILD_LOGS_B64=""
+          if [ -f /tmp/build.log ]; then
+            # Tail ~96KB so payload stays well under any reasonable JSON body limit.
+            BUILD_LOGS_B64="$(tail -c 98304 /tmp/build.log | base64 -w 0)"
+          fi
+
+          BUILD_LOGS_JSON="null"
+          if [ -n "$BUILD_LOGS_B64" ]; then
+            BUILD_LOGS_JSON="\"$BUILD_LOGS_B64\""
+          fi
+
+          PAYLOAD=$(cat <<JSONEOF
+          {"environmentId":"cmufmlntz00062tr1rd85ot7t","serviceName":"$SERVICE_NAME","imageUri":"$IMAGE_URI","commitSha":"$GITHUB_SHA","status":"$JOB_STATUS","runUrl":"$RUN_URL","buildStrategy":"$BUILD_STRATEGY","buildPlan":$BUILD_PLAN_JSON,"buildLogsBase64":$BUILD_LOGS_JSON}
+          JSONEOF
+          )
+
+          RESPONSE="$(curl -sS -X POST https://api.tryliftoff.tech/api/v1/webhooks/deploy-complete \
+            -H "X-Liftoff-Secret: ${{ secrets.LIFTOFF_DEPLOY_SECRET_CMUFMLNTZ00062TR1RD85OT7T }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")"
+          echo "Liftoff responded: $RESPONSE"
+
+          # Liftoff answers 200 for a delivery it accepted but attached to
+          # nothing — a build nobody was waiting for, a duplicate, a superseded
+          # one. That is deliberate: a 4xx would send GitHub into a retry loop
+          # for a callback that can never match. But it used to answer a bare
+          # {"received":true}, so a run whose image was thrown away printed the
+          # same success line as one that deployed, and this log is the only
+          # place anyone looks. Surface it as an annotation instead.
+          case "$RESPONSE" in
+            *'"recorded":false'*)
+              echo "::warning title=Liftoff did not record this build::$RESPONSE"
+              ;;
+          esac
