@@ -159,8 +159,10 @@ jobs:
           # `|| true` on both halves, for the reason the DigitalOcean step
           # gives: a Liftoff that is unreachable, slow or answering an error must
           # fall through to the secrets below rather than kill the step under
-          # `set -e` before the fallback is reached.
-          CREDENTIAL_RESPONSE="$(curl -sS --max-time 30 --retry 2 --retry-connrefused -X POST https://api.tryliftoff.tech/api/v1/build/registry-credential \
+          # `set -e` before the fallback is reached. `-f` for the reason the
+          # DigitalOcean step gives: without it a retried 500 leaves its body in
+          # front of the credential and the parse refuses both.
+          CREDENTIAL_RESPONSE="$(curl -fsS --max-time 30 --retry 2 --retry-connrefused -X POST https://api.tryliftoff.tech/api/v1/build/registry-credential \
             -H "X-Liftoff-Secret: ${LIFTOFF_SECRET:-}" \
             -H "Content-Type: application/json" \
             -d '{"environmentId":"cmum9iand0001y0cdmg44q4aj"}' || true)"
